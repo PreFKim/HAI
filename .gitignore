@@ -2,3 +2,5 @@
 /test.ipynb
 /experiments
 __pycache__
+nohup*.out
+output.csv

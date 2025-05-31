@@ -3,11 +3,10 @@ import torch
 import argparse
 import tqdm
 import os
-import glob
 import yaml
-import sys
 import numpy as np 
 import math
+import shutil
 
 import torch
 import torch.nn as nn
@@ -160,27 +159,43 @@ def train(args):
     if args.exp_name == "":
         exp_num = 0
         while True:
-            save_dir = os.path.join(args.save_dir, str(exp_num))
+            save_dir = os.path.join(args.save_dir, f"{exp_num}_{args.fold_idx}")
             if os.path.exists(save_dir):
                 exp_num += 1
             else:
                 break
+        exp_num = f"{exp_num}_{args.fold_idx}"
     else:
-        exp_num = args.exp_name
+        exp_num = f"{args.exp_name}_{args.fold_idx}"
         save_dir = os.path.join(args.save_dir, str(exp_num))
     print("Experiments num:", exp_num)
-    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(os.path.join(save_dir, 'code'), exist_ok=True)
     arg_dict = vars(args)  
     yaml_str = yaml.dump(arg_dict, default_flow_style=False)
     with open(os.path.join(save_dir, "parameters.yaml"), 'w') as file:
         file.write(yaml_str)
-      
+
+    # 코드 기록
+    shutil.copy('./dataset/augmentations.py', os.path.join(save_dir, 'code', 'augmentations.py'))
+    shutil.copy('./dataset/dataset.py', os.path.join(save_dir, 'code', 'dataset.py'))
+    shutil.copy('./model/baseline.py', os.path.join(save_dir, 'code', 'model.py'))
+    shutil.copy('./train.py', os.path.join(save_dir, 'code', 'train.py'))
+    shutil.copy('./cfg.py', os.path.join(save_dir, 'code', 'cfg.py'))
+    
+    wh = (args.image_width, args.image_height)
+
     train_kwargs = {
         'root_dir':'./dataset/data/train',
+        'wh': wh,
+        'fold_idx':args.fold_idx,
+        'mode': 0,
         'aug':True,
     }
     val_kwargs= {
         'root_dir':'./dataset/data/train',
+        'wh': wh,
+        'fold_idx':args.fold_idx,
+        'mode': 1,
         'aug':False,
     }
     
@@ -188,16 +203,17 @@ def train(args):
 
     valid_set = HAI(**val_kwargs)
 
-    targets = [label for _, label in train_set.samples]
     class_names = train_set.classes
 
-    # Stratified Split
-    train_idx, valid_idx = train_test_split(
-        range(len(targets)), test_size=0.2, stratify=targets, random_state=42
-    )
+    if args.fold_idx < 0:
+        targets = [label for _, label in train_set.samples]
+        # Stratified Split
+        train_idx, valid_idx = train_test_split(
+            range(len(targets)), test_size=0.2, stratify=targets, random_state=42
+        )
 
-    train_set.resample(train_idx)
-    valid_set.resample(valid_idx)
+        train_set.resample(train_idx)
+        valid_set.resample(valid_idx)
 
     print(f"Num Train: {len(train_set)}, Num Valid: {len(valid_set)}")
 
@@ -208,7 +224,7 @@ def train(args):
     
     model_config = {
         'backbone_type': args.backbone_type,
-        'wh' : (args.image_height, args.image_width)
+        'wh' : wh,
         'num_classes':len(train_set.classes)
     }
     model = BaseWraper(**model_config).to(device)
@@ -276,16 +292,17 @@ if __name__ == "__main__":
     # 모델 파라미터
     parser.add_argument("--checkpoint", type=str, default="", help="")
     parser.add_argument("--exp_name", type=str, default="", help="")
-    parser.add_argument("--image_width", type=int, default=192, help="")
-    parser.add_argument("--image_height", type=int, default=256, help="")
-    parser.add_argument("--backbone_type", type=str, default='r50', help="")
+    parser.add_argument("--fold_idx", type=int, default="", help="")
+    parser.add_argument("--image_width", type=int, default=256, help="")
+    parser.add_argument("--image_height", type=int, default=192, help="")
+    parser.add_argument("--backbone_type", type=str, default='r152', help="")
 
     # 하이퍼 파라미터
     parser.add_argument("--num_workers", type=int, default=16, help="")
     parser.add_argument("--random_seed", type=int, default=42, help="Fix random seed")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="")
     parser.add_argument("--epochs", type=int, default=100, help="") 
-    parser.add_argument("--batch_size", type=int, default=128, help="") 
+    parser.add_argument("--batch_size", type=int, default=32, help="") 
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="")
     parser.add_argument("--gpu", type=int, default=0, help="")
