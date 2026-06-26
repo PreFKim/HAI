@@ -1,6 +1,10 @@
 /dataset/data
 /test.ipynb
 /experiments
+/InternImage
+/ops_dcnv3
+/FlashInternImage
+/weights/*.pth
 __pycache__
 nohup*.out
-output.csv
+*.csv

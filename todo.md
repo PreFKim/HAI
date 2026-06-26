@@ -8,7 +8,7 @@
 
 # 데이터 셋 증강
 
-- Cutmix
+- Cutmix [Done]
 
 - RandomCrop [Done]
 
@@ -16,23 +16,21 @@
 
 - Rotate [Done]
 
-- Curriculum learning 
+- Curriculum learning [Done]
 
 # 외부 모델 활용
 
-- Detection (Part detection is best)
-
-- Segmenation (Part Segmentation is best)
+- Detection [Done]
 
 # Train
 
 - K-Fold [Done]
 
-- Model (Convnext V2, ViT, Swin V2, InternImage)
+- Model (Convnext V2, ViT, Swin V2, InternImage) [Done]
 
-- EMA Weight Update
+- EMA Weight Update [Done]
 
-- AttnPool
+- AttnPool [Done]
 
 # 추론
 
@@ -45,3 +43,21 @@
 
 6 17 대회 마감
 
+
+# 증강 변경
+    - Crop 0.25 vs 0.5 [Done] : 0.25가 나음
+    - mean, std 127.5 : 큰차이 없음
+    - BGR2RGB Apply vs no :좀 더 나은 거 같음
+    - mix up
+    - RGB Shift Apply vs no
+    - A.GaussianBlur 추가
+# 학습
+    - EMA : 성능 급감 
+    - Label smoothing 0.1 vs 0 : Log Loss의 특성상 성능이 더 안좋아질 가능성 있음 [Done]
+
+# 모델
+    - Liner 층 개수 0, 1, 2 (Linear->GELU) : 할 수록 성능 급감
+    - Layernorm apply vs no : 성능 감소
+
+# 추론
+    -- TTA 조합

@@ -1,105 +1,28 @@
-import random
 import torch
 import argparse
 import tqdm
 import os
 import yaml
 import numpy as np 
-import math
 import shutil
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from sklearn.model_selection import train_test_split
 
+from torch.cuda.amp import GradScaler, autocast
+
 from dataset.dataset import HAI
+from dataset.augmentations import cutmix_data, mixup_data
 from model.baseline import BaseWraper
+from ema import EMA
+from utils import Accuracy, MixFunc, AllEvaluators, set_seed, warm_cosine, curriculum_scheduler
+from cfg import IN_mean, IN_std, H_mean, H_std
 
-def Accuracy(pred, target):
-    _, pred = torch.max(pred, 1)
-    return (pred == target).float().mean()
 
-class AllLosses(nn.Module):
-    def __init__(self, loss_lst=[], weights=None, names=None):
-        super(AllLosses, self).__init__()
-        self.loss_lst = loss_lst    
-        if weights is not None:
-            self.weights = weights
-            if (len(loss_lst) != len(weights)):
-                raise ValueError("Lenght of weights is differ from length of loss_lst")
-        else : 
-            self.weights = [1. for _ in range(len(loss_lst))]
-
-        if names is not None:
-            self.names = names
-            if (len(loss_lst) != len(names)):
-                raise ValueError("Lenght of names is differ from length of loss_lst")
-        else : 
-            self.names = [f"Loss {i}" for i in range(len(loss_lst))]
-
-    def forward(self, pairs):
-        ret = {
-            'Total':0
-            }
-        # for i in range(len(self.loss_lst)):
-        for i in range(len(pairs)):
-            ret[self.names[i]] = self.loss_lst[i](*pairs[i]) * self.weights[i]
-            ret['Total'] = ret['Total'] + ret[self.names[i]]
-        return ret
-
-class AllMetrics(nn.Module):
-    def __init__(self, metric_lst=[], weights=None, names=None):
-        super(AllMetrics, self).__init__()
-        self.metric_lst = metric_lst    
-        if weights is not None:
-            self.weights = weights
-            if (len(metric_lst) != len(weights)):
-                raise ValueError("Lenght of weights is differ from length of metric_lst")
-        else : 
-            self.weights = [1. for _ in range(len(metric_lst))]
-
-        if names is not None:
-            self.names = names
-            if (len(metric_lst) != len(names)):
-                raise ValueError("Lenght of names is differ from length of metric_lst")
-        else : 
-            self.names = [f"Loss {i}" for i in range(len(metric_lst))]
-
-    def forward(self, pairs):
-        with torch.no_grad():
-            ret = {
-                'Total':0
-                }
-            # for i in range(len(self.metric_lst)):
-            for i in range(len(pairs)):
-                ret[self.names[i]] = self.metric_lst[i](*pairs[i]) * self.weights[i]
-                ret['Total'] = ret['Total'] + ret[self.names[i]]
-        return ret
-
-def set_seed(seed):
-    if seed >= 0:
-        random.seed(seed)
-        os.environ['PYTHONHASHSEED'] = str(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-def warm_cosine(step: int, warmup_ratio: int, total_steps: int) -> float:
-    # Linear warmup
-    warmup_steps = int(total_steps*warmup_ratio)
-    if step < warmup_steps:
-        return float(step) / float(max(1.0, warmup_steps))
-    
-    # Cosine decay
-    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-def steps(args, epoch, dataloader, model, optimizer, criterion, metric, scheduler=None, device='cpu', mode=0):
+def steps(args, epoch, dataloader, model, optimizer, criterion, metric, scaler, scheduler=None, ema=None, device='cpu', mode=0, difficulty=1.):
 
     model = model.to(device)
 
@@ -112,16 +35,26 @@ def steps(args, epoch, dataloader, model, optimizer, criterion, metric, schedule
     for i, data in enumerate(iterator):
         image = data['image'].to(device) 
         target = data['target'].to(device) 
-    
-        pred = model(image)
 
-        loss_pairs = [[pred, target]]
-        metric_pairs = [[pred, target]]
-        # if i%100==0:
-        #     print(model.pose_head[0].weight)
+        if np.random.uniform() < args.mix_ratio*difficulty and mode == 0:
+            if np.random.uniform() < args.cutmix_ratio:
+                mix_image, target1, target2, lam = cutmix_data(image, target, alpha=1)
+            else:
+                mix_image, target1, target2, lam = mixup_data(image, target, alpha=0.8)
+            with autocast():
+                pred = model(mix_image)['output']
+            loss_pairs = [[pred, target1, target2, lam]]
+            metric_pairs = [[pred, target1, target2, lam]] 
+        else:
+            with autocast():
+                pred = model(image)['output']
+            loss_pairs = [[pred, target]]
+            metric_pairs = [[pred, target]]
+            
+        with autocast():
 
-        losses = criterion(loss_pairs)
-        metrics = metric(metric_pairs)
+            losses = criterion(loss_pairs)
+            metrics = metric(metric_pairs)
         
         for k, v in losses.items():
             if summation_loss.get(k) is not None:
@@ -136,11 +69,15 @@ def steps(args, epoch, dataloader, model, optimizer, criterion, metric, schedule
                 summation_metric[k] = v.detach().cpu().numpy()
         
         if mode == 0:
-            losses['Total'].backward()
-            optimizer.step()
+            scaler.scale(losses['Total']).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
+            if ema is not None:
+                ema.update_weight()
         loss_info = ''
         for k, v in summation_loss.items():
             loss_info = loss_info + f'{k}:{v/(i+1)}, '
@@ -155,6 +92,9 @@ def steps(args, epoch, dataloader, model, optimizer, criterion, metric, schedule
 def train(args):
 
     print(args)
+    
+    if args.erase_other_car:
+        args.det_crop = True
 
     if args.exp_name == "":
         exp_num = 0
@@ -181,20 +121,37 @@ def train(args):
     shutil.copy('./model/baseline.py', os.path.join(save_dir, 'code', 'model.py'))
     shutil.copy('./train.py', os.path.join(save_dir, 'code', 'train.py'))
     shutil.copy('./cfg.py', os.path.join(save_dir, 'code', 'cfg.py'))
-    
+    if args.normalize_type == "IN":
+        mean = IN_mean
+        std = IN_std
+    else:
+        mean = H_mean
+        std = H_std
     wh = (args.image_width, args.image_height)
 
     train_kwargs = {
         'root_dir':'./dataset/data/train',
+        'det_path':'./dataset/detection/processed/train_det.json', 
         'wh': wh,
         'fold_idx':args.fold_idx,
+        'n_fold':args.n_fold,
+        'det_crop':args.det_crop,
+        'erase_other_car':args.erase_other_car,
+        'mean':mean,
+        'std':std,
         'mode': 0,
         'aug':True,
     }
     val_kwargs= {
         'root_dir':'./dataset/data/train',
+        'det_path':'./dataset/detection/processed/train_det.json', 
         'wh': wh,
         'fold_idx':args.fold_idx,
+        'n_fold':args.n_fold,
+        'det_crop':args.det_crop,
+        'erase_other_car':args.erase_other_car,
+        'mean':mean,
+        'std':std,
         'mode': 1,
         'aug':False,
     }
@@ -206,7 +163,7 @@ def train(args):
     class_names = train_set.classes
 
     if args.fold_idx < 0:
-        targets = [label for _, label in train_set.samples]
+        targets = [label for _, _, label in train_set.samples]
         # Stratified Split
         train_idx, valid_idx = train_test_split(
             range(len(targets)), test_size=0.2, stratify=targets, random_state=42
@@ -218,6 +175,8 @@ def train(args):
     print(f"Num Train: {len(train_set)}, Num Valid: {len(valid_set)}")
 
     device = "cpu" if args.gpu == -1 else f"cuda:{args.gpu}"
+    if args.gpu >= 0: # InternImage GPU 문제 때문에 설정
+        torch.cuda.set_device(args.gpu)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     valid_loader = DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
@@ -225,9 +184,21 @@ def train(args):
     model_config = {
         'backbone_type': args.backbone_type,
         'wh' : wh,
-        'num_classes':len(train_set.classes)
+        'num_classes':len(train_set.classes),
+        'pool_type':args.pool_type,
+        'cls_token_per_class': args.cls_token_per_class,
+        'n_linear':args.n_linear,
+        'layernorm':args.layernorm,
+        'mean':mean.tolist(),
+        'std':std.tolist(),
     }
     model = BaseWraper(**model_config).to(device)
+    scaler = GradScaler()
+    ema = None
+    if args.ema_alpha>0:
+        print("EMA Model Ready")
+        ema_model = BaseWraper(**model_config).to(device)
+        ema = EMA(model, ema_model, max_alpha=args.ema_alpha)
     
     
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -239,25 +210,35 @@ def train(args):
         print(model.load_state_dict(ckpt['model'], strict=False))
     
     
-    loss_lst = [nn.CrossEntropyLoss()]
-    loss_names = [f'CE']
+    loss_lst = [MixFunc(nn.CrossEntropyLoss(label_smoothing=args.label_smoothing))]
+    loss_names = [f'Cutmix(CE)']
     loss_weights = [1.]
     
-    criterion = AllLosses(loss_lst, weights=loss_weights, names=loss_names)
-
-    metric_lst = [Accuracy]
-    metric_names = ['ACC']
+    criterion = AllEvaluators(loss_lst, weights=loss_weights, names=loss_names)
+    
+    metric_lst = [MixFunc(Accuracy)]
+    metric_names = ['Cutmix(ACC)']
     metric_weights = [1.]
-    metric = AllMetrics(metric_lst, weights=metric_weights, names=metric_names)
+    metric = AllEvaluators(metric_lst, weights=metric_weights, names=metric_names, is_metric=True)
 
     train_losses = []
     valid_losses = []
+    ema_valid_losses = []
     for i in range(args.epochs):
+        if args.curriculum:
+            train_set.difficulty = curriculum_scheduler(i, args.epochs)
+            print(f"Curr difficulty : {train_set.difficulty}")
         model = model.train()
-        train_losses.append(steps(args, i+1, train_loader, model, optimizer, criterion, metric, scheduler, device, mode=0))
+        train_losses.append(steps(args, i+1, train_loader, model, optimizer, criterion, metric, scaler, scheduler, ema, device, mode=0, difficulty=train_set.difficulty))
         model = model.eval()
         with torch.no_grad():
-            valid_losses.append(steps(args, i+1, valid_loader, model, optimizer, criterion, metric, scheduler, device, mode=1))
+            valid_losses.append(steps(args, i+1, valid_loader, model, optimizer, criterion, metric, scaler, scheduler, ema, device, mode=1, difficulty=train_set.difficulty))
+
+        if ema is not None:
+            ema_model = ema.ema_model.eval()
+            with torch.no_grad():
+                ema_valid_losses.append(steps(args, i+1, valid_loader, ema_model, optimizer, criterion, metric, scaler, scheduler, ema, device, mode=1, difficulty=train_set.difficulty))
+            
 
 
         ckpt = {
@@ -265,6 +246,9 @@ def train(args):
             "config": model_config,
             "class_names": class_names,
             "model": model.state_dict(),
+            **({
+                "ema_model": ema.state_dict(),
+                } if ema is not None else {}),
         }
 
         print(f"Epoch {i+1} Endded")
@@ -273,7 +257,7 @@ def train(args):
 
         torch.save(ckpt, os.path.join(save_dir, "last.pt"))
 
-        if (i+1)%5 == 0:
+        if (i+1)%(args.epochs//5) == 0:
             torch.save(ckpt, os.path.join(save_dir, f"last_{i+1}.pt"))
 
         if valid_losses[-1] <= min(valid_losses):
@@ -281,6 +265,11 @@ def train(args):
             print(f"Best Validation Loss {i+1} : {valid_losses[i]}")
             print(f"Saved at {os.path.join(save_dir, 'best.pt')}")
 
+        if ema is not None:
+            if ema_valid_losses[-1] <= min(ema_valid_losses):
+                torch.save(ckpt, os.path.join(save_dir, "best_ema.pt"))
+                print(f"Best EMA Validation Loss {i+1} : {ema_valid_losses[i]}")
+                print(f"Saved at {os.path.join(save_dir, 'best_ema.pt')}")
 
         print("")
 
@@ -288,16 +277,32 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--save_dir", type=str, default="./experiments", help="")
+    parser.add_argument("--exp_name", type=str, default="", help="")
 
     # 모델 파라미터
     parser.add_argument("--checkpoint", type=str, default="", help="")
-    parser.add_argument("--exp_name", type=str, default="", help="")
-    parser.add_argument("--fold_idx", type=int, default="", help="")
-    parser.add_argument("--image_width", type=int, default=256, help="")
-    parser.add_argument("--image_height", type=int, default=192, help="")
-    parser.add_argument("--backbone_type", type=str, default='r152', help="")
+    parser.add_argument("--image_width", type=int, default=512, help="")
+    parser.add_argument("--image_height", type=int, default=382, help="")
+    parser.add_argument("--backbone_type", type=str, default='fb', help="")
+    parser.add_argument("--layernorm", action='store_true', help="")
+    parser.add_argument("--n_linear", type=int, default=0, help="")
+    parser.add_argument("--pool_type", type=str, default='avg', help="")
+    parser.add_argument("--cls_token_per_class", action='store_true', help="")
+
+    # 데이터 파라미터
+    parser.add_argument("--normalize_type", type=str, default='IN', help="IN: ImageNet, H: Harf")
+    parser.add_argument("--mix_ratio", type=float, default=0.25, help="")
+    parser.add_argument("--cutmix_ratio", type=float, default=.5, help="")
+    parser.add_argument("--curriculum", action='store_true', help="")
+    parser.add_argument("--det_crop", action='store_true', help="")
+    parser.add_argument("--erase_other_car", action='store_true', help="")
+    
+    # K-Fold 파라미터
+    parser.add_argument("--fold_idx", type=int, default=-1, help="")
+    parser.add_argument("--n_fold", type=int, default=5, help="")
 
     # 하이퍼 파라미터
+    parser.add_argument("--label_smoothing", type=float, default=0.0, help="")
     parser.add_argument("--num_workers", type=int, default=16, help="")
     parser.add_argument("--random_seed", type=int, default=42, help="Fix random seed")
     parser.add_argument("--warmup_ratio", type=float, default=0.1, help="")
@@ -305,6 +310,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32, help="") 
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="")
+    parser.add_argument("--ema_alpha", type=float, default=0., help="")
     parser.add_argument("--gpu", type=int, default=0, help="")
 
     args = parser.parse_args()
